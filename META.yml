@@ -3,6 +3,7 @@ abstract: 'level-triggered resource observer like select(2)'
 author:
   - 'Toshio Ito <debug.ito@gmail.com>'
 build_requires:
+  FindBin: 0
   List::Util: 0
   Test::Exception: 0
   Test::More: 0
@@ -22,4 +23,5 @@ no_index:
     - inc
 requires:
   Carp: 0
-version: 0.02
+  Scalar::Util: 0
+version: 1.01

@@ -8,22 +8,22 @@ my $selector = Async::Selector->new();
 
 ## Register resource
 my $resource = "some text.";  ## 10 bytes
-$selector->register(
-    resource_A => sub {
-        my $threshold = shift;
-        return length($resource) >= $threshold ? $resource : undef;
-    }
-);
+
+$selector->register(resource_A => sub {
+    ## If $resource has more data than $threshold bytes, provide it.
+    my $threshold = shift;
+    return length($resource) >= $threshold ? $resource : undef;
+});
 
 
-## Select the resource with a callback.
-$selector->select(
-    sub {
-        my ($id, %resource) = @_;
+## Watch the resource with a callback.
+$selector->watch(
+    resource_A => 20,  ## When the resource gets more than 20 bytes...
+    sub {              ## ... execute this callback.
+        my ($watcher, %resource) = @_;
         print "$resource{resource_A}\n";
-        return 1;
-    },
-    resource_A => 20,  ## Tell me when the resource gets more than 20 bytes!
+        $watcher->cancel();
+    }
 );
 
 
@@ -33,5 +33,3 @@ $selector->trigger('resource_A'); ## Nothing happens
 
 $resource .= "more data";  ## 23 bytes
 $selector->trigger('resource_A'); ## The callback prints 'some text.datamore data'
-
-

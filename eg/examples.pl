@@ -3,9 +3,41 @@ use warnings;
 
 use Async::Selector;
 
+{
+    ## Level-triggered vs. Edge-triggered
+    
+    my $selector = Async::Selector->new();
+    my $a = 10;
+    $selector->register(a => sub { my $t = shift; return $a >= $t ? $a : undef });
+
+    ## Level-triggered watch
+    $selector->watch_lt(a => 5, sub { ## => LT: 10
+        my ($watcher, %res) = @_;
+        print "LT: $res{a}\n";
+    });
+    $selector->trigger('a');          ## => LT: 10
+    $a = 12;
+    $selector->trigger('a');          ## => LT: 12
+    $a = 3;
+    $selector->trigger('a');          ## Nothing happens because $a == 3 < 5.
+
+    ## Edge-triggered watch
+    $selector->watch_et(a => 2, sub { ## Nothing happens because it's edge-triggered
+        my ($watcher, %res) = @_;
+        print "ET: $res{a}\n";
+    });
+    $selector->trigger('a');          ## => ET: 3
+    $a = 0;
+    $selector->trigger('a');          ## Nothing happens.
+    $a = 10;
+    $selector->trigger('a');          ## => LT: 10
+                                      ## => ET: 10
+}
+
+print "=================\n";
 
 {
-    ## Multiple resources, multiple selections
+    ## Multiple resources, multiple watches
     
     my $selector = Async::Selector->new();
     my $a = 5;
@@ -16,24 +48,20 @@ use Async::Selector;
         b => sub { my $t = shift; return $b >= $t ? $b : undef },
         c => sub { my $t = shift; return $c >= $t ? $c : undef },
     );
-    $selector->select(
+    $selector->watch(a => 10, sub {
+        my ($watcher, %res) = @_;
+        print "Select 1: a is $res{a}\n";
+        $watcher->cancel();
+    });
+    $selector->watch(
+        a => 12, b => 15, c => 15,
         sub {
-            my ($id, %res) = @_;
-            print "Select 1: a is $res{a}\n";
-            return 1;
-        },
-        a => 10
-    );
-    $selector->select(
-        sub {
-            my ($id, %res) = @_;
+            my ($watcher, %res) = @_;
             foreach my $key (sort keys %res) {
-                next if not defined($res{$key});
                 print "Select 2: $key is $res{$key}\n";
             }
-            return 1;
-        },
-        a => 12, b => 15, c => 15,
+            $watcher->cancel();
+        }
     );
 
     ($a, $b, $c) = (11, 14, 14);
@@ -47,7 +75,7 @@ use Async::Selector;
 print "==============\n";
 
 {
-    ## Auto-cancel and non-cancel selections
+    ## One-shot and persistent watches
     my $selector = Async::Selector->new();
     my $A = "";
     my $B = "";
@@ -56,39 +84,33 @@ print "==============\n";
         B => sub { my $in = shift; return length($B) >= $in ? $B : undef },
     );
 
-    my $sel_a = $selector->select(
-        sub {
-            my ($id, %res) = @_;
-            print "A: $res{A}\n";
-            return 1; ## auto-cancel
-        },
-        A => 5
-    );
-    my $sel_b = $selector->select(
-        sub {
-            my ($id, %res) = @_;
-            print "B: $res{B}\n";
-            return 0; ## non-cancel
-        },
-        B => 5
-    );
+    my $watcher_a = $selector->watch(A => 5, sub {
+        my ($watcher, %res) = @_;
+        print "A: $res{A}\n";
+        $watcher->cancel(); ## one-shot callback
+    });
+    my $watcher_b = $selector->watch(B => 5, sub {
+        my ($watcher, %res) = @_;
+        print "B: $res{B}\n";
+        ## persistent callback
+    });
 
     ## Trigger the resources.
-    ## Execution order of selection callbacks is not guaranteed.
+    ## Execution order of watcher callbacks is not guaranteed.
     ($A, $B) = ('aaaaa', 'bbbbb');
-    $selector->trigger('A', 'B');   ## -> B: bbbbb
-                                    ## -> A: aaaaa
+    $selector->trigger('A', 'B');   ## -> A: aaaaa
+                                    ## -> B: bbbbb
     print "--------\n";
-    ## $sel_a is automatically canceled.
+    ## $watcher_a is already canceled.
     ($A, $B) = ('AAAAA', 'BBBBB');
     $selector->trigger('A', 'B');   ## -> B: BBBBB
     print "--------\n";
 
     $B = "CCCCCCC";
-    $selector->trigger('A', 'B');        ## -> B: CCCCCCC
+    $selector->trigger('A', 'B');   ## -> B: CCCCCCC
     print "--------\n";
 
-    $selector->cancel($sel_b);
+    $watcher_b->cancel();
     $selector->trigger('A', 'B');        ## Nothing happens.
 }
 

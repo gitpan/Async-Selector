@@ -2,9 +2,13 @@ use strict;
 use warnings;
 use Test::More;
 use Test::Builder;
-use List::Util qw(first);
 
-package Sample::Resources;
+use FindBin;
+use lib "$FindBin::RealBin/lib";
+use Async::Selector::testutils;
+
+
+package Async::Selector::Sample::Resources;
 use strict;
 use warnings;
 
@@ -43,29 +47,15 @@ BEGIN {
 }
 
 sub collector {
-    my ($result_ref, $ret_val) = @_;
+    my ($result_ref, $one_shot) = @_;
     return sub {
-        my ($id, %res) = @_;
-        push(@$result_ref, map { sprintf("%s:%s", $_, $res{$_}) } grep { defined($res{$_}) } keys %res);
-        return $ret_val;
-    };
-}
-
-sub checkArray {
-    my ($label, $result_ref, @exp_list) = @_;
-    local $Test::Builder::Level = $Test::Builder::Level + 1;
-    cmp_ok(int(@$result_ref), "==", int(@exp_list), sprintf("$label num == %d", int(@exp_list)));
-    my @result = @$result_ref;
-    foreach my $exp_str (@exp_list) {
-        my $found_index = first { $result[$_] eq $exp_str } 0..$#result;
-        ok(defined($found_index), "$label includes $exp_str");
-        my @new_result = ();
-        foreach my $i (0 .. $#result) {
-            push @new_result, $result[$i] if $i != $found_index;
+        my ($w, %res) = @_;
+        ok(defined($res{$_}), "value for key $_ is defined.") foreach keys %res;
+        push(@$result_ref, map { sprintf("%s:%s", $_, $res{$_}) } keys %res);
+        if($one_shot) {
+            $w->cancel();
         }
-        @result = @new_result;
-    }
-    cmp_ok(int(@result), "==", 0, "checked all $label");
+    };
 }
 
 sub checkResult {
@@ -74,71 +64,110 @@ sub checkResult {
     checkArray('result', $result_ref, @exp_list);
 }
 
-sub checkSelections {
-    my ($selector, @exp_list) = @_;
-    local $Test::Builder::Level = $Test::Builder::Level + 1;
-    checkArray('selection', [$selector->selections], @exp_list);
+{
+    note('--- N-resource: resources in watcher callback should only have keys for available resource.');
+    my $s = new_ok('Async::Selector');
+    my $rs = Async::Selector::Sample::Resources->new($s, 1 .. 5);
+    my $fired = 0;
+    my $w;
+    $w = $s->watch(1 => 0, 2 => 5, 4 => 2, sub {
+        my ($watcher, %res) = @_;
+        $fired = 1;
+        ok(!defined($w), '$w is not defined at this time because this is immediate fire.');
+        checkCond($watcher, [1,2,4], {1=>0, 2=>5, 4=>2}, "watcher in callback");
+        is($res{1}, "", "got resource 1");
+        ok(!exists($res{$_}), "No key for resource $_") foreach 2..5;
+        $watcher->cancel();
+    });
+    ok($fired, "watcher fired.");
+    ok(!$w->active, "watcher fired.");
+    
+    $fired = 0;
+    $w = $s->watch(3 => 3, 4 => 4, 5 => 5, 6 => 6, sub {
+        my ($watcher, %res) = @_;
+        $fired = 1;
+        is($watcher, $w, '$watcher is actually $w.');
+        checkCond($watcher, [3,4,5,6], {3=>3, 4=>4, 5=>5, 6=>6}, "watcher in callback");
+        is($res{3}, "cccc", "got resource 3");
+        is($res{4}, "dddd", "got resource 4");
+        ok(!exists($res{$_}), "No key for resource $_") foreach (1,2,5,6);
+    });
+    ok(!$fired, "not yet fired");
+    ok($w->active);
+    $rs->set(1 => 'aaaa', 2 => 'bbbb', 3 => 'cccc', 4 => "dddd", 5 => "eeee");
+    ok($fired, "fired");
+    ok($w->active);
+    $w->cancel();
+    $fired = 0;
+    ok(!$w->active);
+    $rs->set(1 => 'aaaaaa', 2 => 'bbbbbb', 3 => 'cccccc', 4 => "dddddd", 5 => "eeeeee");
+    ok(!$fired, "not fired because already canceled");
 }
-
-sub checkSNum {
-    my ($selector, $selection_num) = @_;
-    local $Test::Builder::Level = $Test::Builder::Level + 1;
-    is(int($selector->selections), $selection_num, "$selection_num selections.");
-}
-
-
-
-note('Test for N-resource M-selection.');
 
 {
-    note('--- N-resource, 1-selection.');
+    note('--- N-resource, registered()');
+    my $s = new_ok('Async::Selector');
+    my $rs = Async::Selector::Sample::Resources->new($s, 1 .. 10);
+    ok( $s->registered($_), "$_ is registered") foreach (1..10);
+    ok(!$s->registered($_), "$_ is not registered") foreach (0, 11..15);
+}
+
+{
+    note('--- N-resource, 1-watch.');
     my $N = 5;
     my $s = new_ok('Async::Selector');
-    my $rs = Sample::Resources->new($s, 1 .. $N);
+    my $rs = Async::Selector::Sample::Resources->new($s, 1 .. $N);
     my @result = ();
-    $s->select(collector(\@result, 1), 1 => 3, 2 => 4, 3 => 2, 4 => 9, 5 => 2);
+    my $w = $s->watch(1 => 3, 2 => 4, 3 => 2, 4 => 9, 5 => 2, collector(\@result, 1));
+    ok($w->active, "w is active now.");
     checkResult \@result;
     $rs->set(1 => "sk", 2 => "sas", 3 => "", 4 => "abcdefgh", 5 => "Y");
     checkResult \@result;
     $rs->set(1 => "ab", 2 => "asas", 3 => "BB",               5 => "ybb");
     checkResult \@result, qw(2:asas 3:BB 5:ybb);
-    checkSelections $s;
+    checkWatchers $s;
+    ok(!$w->active, "w is fired and inactive now");
     @result = ();
     $rs->set(map {$_ => "this_is_a_long_string"} 1 .. $N);
-    cmp_ok(int(@result), "==", 0, "no result because the selection is removed.");
+    cmp_ok(int(@result), "==", 0, "no result because the watcher is removed.");
 
     @result = ();
-    my $id = $s->select(collector(\@result, 0), 1 => 0, 2 => 3, 3 => 4);
+    $w = $s->watch(1 => 0, 2 => 3, 3 => 4, collector(\@result, 0));
     checkResult \@result, qw(1:this_is_a_long_string 2:this_is_a_long_string 3:this_is_a_long_string);
     @result = ();
     $rs->set(1 => "", 2 => "aa", 3 => "bb", 4 => "cc", 5 => "dd");
     checkResult \@result, qw(1:);
-    checkSelections $s, $id;
+    checkWatchers $s, $w;
+    ok($w->active, "w is active");
     @result = ();
     $s->trigger(1 .. $N);
     checkResult \@result, qw(1:);
     @result = ();
     $s->trigger(3);
-    checkResult \@result, qw(1:);
+    checkResult \@result;
     @result = ();
     $rs->set(2 => "aaa", 3 => "bbbb", 4 => "ccccc", 5 => "dddddd");
-    checkResult \@result, qw(1: 2:aaa 3:bbbb);
+    ok($w->active, "w is still active");
+    checkResult \@result, qw(2:aaa 3:bbbb);
 
-    note("--- -- if the triggered resource is not selected, the selection callback is not executed.");
+    note("--- -- if the triggered resource is not selected, the watcher callback is not executed.");
     @result = ();
     $s->trigger(4, 5);
     checkResult \@result;
 
-    $s->cancel($id);
+    checkWatchers $s, $w;
+    $w->cancel();
+    checkWatchers $s;
+    ok(!$w->active, "w is inactive now");
 
     @result = ();
     $rs->set(map {$_ => ""} 1 .. $N);
     checkResult \@result;
 
     @result = ();
-    $id = $s->select(collector(\@result, 0), 3 => 3, 4 => 4, 5 => 5);
+    $w = $s->watch(3 => 3, 4 => 4, 5 => 5, collector(\@result, 0));
     checkResult \@result;
-    checkSelections $s, $id;
+    checkWatchers $s, $w;
     @result = ();
     $rs->set(1 => "a", 2 => "b", 3 => "c", 4 => "d", 5 => "e");
     checkResult \@result;
@@ -154,157 +183,211 @@ note('Test for N-resource M-selection.');
 }
 
 {
-    note('--- 1-resource, M-selections');
+    note('--- 1-resource, M-watchers');
     my $s = new_ok('Async::Selector');
-    my $rs = Sample::Resources->new($s, 1);
+    my $rs = Async::Selector::Sample::Resources->new($s, 1);
     my @result = ();
-    note('--- -- non-remove selections');
-    my @ids = ();
-    push @ids, $s->select(collector(\@result, 0), 1 => 1);
-    push @ids, $s->select(collector(\@result, 0), 1 => 2);
+    note('--- -- continuous watchers');
+    my @watchers = ();
+    my $w;
+    push @watchers, $s->watch(1 => 1, collector(\@result, 0));
+    push @watchers, $s->watch(1 => 2, collector(\@result, 0));
     checkResult \@result;
-    checkSelections $s, @ids;
+    checkWatchers $s, @watchers;
     $rs->set(1 => "A");
     checkResult \@result, qw(1:A);
-    checkSelections $s, @ids;
+    checkWatchers $s, @watchers;
     @result = ();
     $rs->set(1 => "BB");
     checkResult \@result, qw(1:BB 1:BB);
-    checkSelections $s, @ids;
+    checkWatchers $s, @watchers;
     @result = ();
     $rs->set(1 => 'a');
     checkResult \@result, qw(1:a);
-    checkSelections $s, @ids;
-    $s->cancel(@ids);
-    checkSelections $s;
+    checkWatchers $s, @watchers;
+    ok($_->active, "watcher active") foreach @watchers;
+    $_->cancel() foreach @watchers;
+    checkWatchers $s;
     @result = ();
     $rs->set(1 => 'abcde');
     checkResult \@result;
+    ok(!$_->active, "watcher inactive") foreach @watchers;
 
-    note('--- -- auto-remove selections');
+    note('--- -- one-shot watchers');
     @result = ();
-    $s->select(collector(\@result, 1), 1 => 4);
+    $w = $s->watch(1 => 4, collector(\@result, 1));
+    ok(!$w->active, "immediate fire gives inactive watcher");
+    checkCond($w, [1], {1 => 4}, "inactive watcher");
     checkResult \@result, qw(1:abcde);
-    checkSNum $s, 0;
-    $s->select(collector(\@result, 1), 1 => 6);
+    checkWNum $s, 0;
+    $w = $s->watch(1 => 6, collector(\@result, 1));
+    ok($w->active, "this is still active");
+    checkCond($w, [1], {1 => 6}, "active watcher");
     checkResult \@result, qw(1:abcde);
-    checkSNum $s, 1;
-    $s->select(collector(\@result, 1), 1 => 7);
+    checkWNum $s, 1;
+    $w = $s->watch(1 => 7, collector(\@result, 1));
+    ok($w->active, "this is still active");
     checkResult \@result, qw(1:abcde);
-    checkSNum $s, 2;
-    $s->select(collector(\@result, 1), 1 => 3);
+    checkWNum $s, 2;
+    $w = $s->watch(1 => 3, collector(\@result, 1));
+    ok(!$w->active, "fire immediately");
     checkResult \@result, qw(1:abcde 1:abcde);
-    checkSNum $s, 2;
-    $s->select(collector(\@result, 1), 1 => 8);
+    checkWNum $s, 2;
+    $w = $s->watch(1 => 8, collector(\@result, 1));
+    ok($w->active, "still active");
     checkResult \@result, qw(1:abcde 1:abcde);
-    checkSNum $s, 3;
-    $s->select(collector(\@result, 1), 1 => 9);
+    checkWNum $s, 3;
+    $w = $s->watch(1 => 9, collector(\@result, 1));
+    ok($w->active, "still active");
     checkResult \@result, qw(1:abcde 1:abcde);
-    checkSNum $s, 4;
+    checkWNum $s, 4;
     @result = ();
     $rs->set(1 => "666666");
     checkResult \@result, "1:666666";
-    checkSNum $s, 3;
+    checkWNum $s, 3;
     $rs->set(1 => "7777777");
     checkResult \@result, qw(1:666666 1:7777777);
-    checkSNum $s, 2;
+    checkWNum $s, 2;
     $rs->set(1 => "88888888");
     checkResult \@result, qw(1:666666 1:7777777 1:88888888);
-    checkSNum $s, 1;
+    checkWNum $s, 1;
     $rs->set(1 => "999999999");
     checkResult \@result, qw(1:666666 1:7777777 1:88888888 1:999999999);
-    checkSNum $s, 0;
+    checkWNum $s, 0;
     @result = ();
     foreach my $num (10 .. 15) {
         $rs->set(1 => "A" x $num);
         checkResult \@result;
     }
     
-    note('--- -- mix auto-remove and non-remove selections');
+    note('--- -- mix one-shot and continuous watchers');
     $rs->set(1 => "");
     @result = ();
-    @ids = ();
-    push @ids, $s->select(collector(\@result, 0), 1 => 5);
-    $s->select(collector(\@result, 1), 1 => 6);
-    push @ids, $s->select(collector(\@result, 0), 1 => 7);
-    $s->select(collector(\@result, 1), 1 => 8);
+    @watchers = ();
+    push @watchers, $s->watch(1 => 5, collector(\@result, 0));
+    push @watchers, $s->watch(1 => 6, collector(\@result, 1));
+    push @watchers, $s->watch(1 => 7, collector(\@result, 0));
+    push @watchers, $s->watch(1 => 8, collector(\@result, 1));
     checkResult \@result;
+    checkWatchers $s, @watchers;
     @result = ();
     $rs->set(1 => "qqqq");
     checkResult \@result;
-    checkSNum $s, 4;
+    checkWNum $s, 4;
     @result = ();
     $rs->set(1 => "wwwww");
     checkResult \@result, "1:wwwww";
-    checkSNum $s, 4;
+    checkWNum $s, 4;
     @result = ();
     $rs->set(1 => "eeeeee");
     checkResult \@result, qw(1:eeeeee 1:eeeeee);
-    checkSNum $s, 3;
+    checkWNum $s, 3;
+    ok(!$watchers[1]->active, "watcher 1 fired and gets inactive.");
     @result = ();
     $rs->set(1 => "rrrrrrr");
     checkResult \@result, qw(1:rrrrrrr 1:rrrrrrr);
-    checkSNum $s, 3;
+    checkWNum $s, 3;
     @result = ();
     $rs->set(1 => "tttttttt");
     checkResult \@result, qw(1:tttttttt 1:tttttttt 1:tttttttt);
-    checkSNum $s, 2;
+    checkWNum $s, 2;
+    ok(!$watchers[3]->active, "watcher 3 fired and gets inactive.");
     foreach my $num (9 .. 12) {
         @result = ();
         $rs->set(1 => ("A" x $num));
         checkResult \@result, ('1:' . ("A" x $num)) x 2;
     }
-    $s->cancel(@ids);
-    checkSNum $s, 0;
+    $_->cancel() foreach @watchers;
+    checkWNum $s, 0;
     foreach my $i (1 .. 3) {
         @result = ();
         $rs->set(1 => "PPPPPPPPPPPPPP");
         checkResult \@result;
     }
     
-    note('--- -- cancel() some of the selections');
+    note('--- -- cancel() some of the watchers');
     $rs->set(1 => "a");
-    @ids = ();
+    @watchers = ();
     @result = ();
-    push @ids, $s->select(collector(\@result, 0), 1 => $_) foreach 1 .. 10;
+    push @watchers, $s->watch(1 => $_, collector(\@result, 0)) foreach 1 .. 10;
     checkResult \@result, "1:a";
-    checkSelections $s, @ids;
+    checkWatchers $s, @watchers;
     @result = ();
-    $s->cancel(@ids[2, 4, 5, 8]); ## 1 2 4 7 8 10
-    checkSelections $s, @ids[0, 1, 3, 6, 7, 9];
+    $_->cancel() foreach @watchers[2, 4, 5, 8]; ## 1 2 4 7 8 10
+    checkWatchers $s, @watchers[0, 1, 3, 6, 7, 9];
     $rs->set(1 => "bbbbbb");
     checkResult(\@result, ("1:bbbbbb") x 3);
 }
 
 {
-    note('--- N-resource, M-selections');
+    note('--- N-resource, M-watchers');
     my $s = new_ok('Async::Selector');
-    my $rs = Sample::Resources->new($s, 1 .. 5);
+    my $rs = Async::Selector::Sample::Resources->new($s, 1 .. 5);
     my @result = ();
-    $s->select(collector(\@result, 1), 1 => 5, 2 => 5, 3 => 5);
-    $s->select(collector(\@result, 1),         2 => 4, 3 => 4, 4 => 4);
-    $s->select(collector(\@result, 1), 1 => 5,                 4 => 5, 5 => 5);
-    $s->select(collector(\@result, 1),         2 => 0, 3 => 0, 4 => 3, 5 => 5);
-    $s->select(collector(\@result, 1), 1 => 2,                 4 => 5, 5 => 2);
-    $s->select(collector(\@result, 1),         2 => 4, 3 => 4);
+    my @w = ();
+    push @w, $s->watch(1 => 5, 2 => 5, 3 => 5                , collector(\@result, 1));
+    push @w, $s->watch(        2 => 4, 3 => 4, 4 => 4        , collector(\@result, 1));
+    push @w, $s->watch(1 => 5,                 4 => 5, 5 => 5, collector(\@result, 1));
+    push @w, $s->watch(        2 => 0, 3 => 0, 4 => 3, 5 => 5, collector(\@result, 1));
+    push @w, $s->watch(1 => 2,                 4 => 5, 5 => 2, collector(\@result, 1));
+    push @w, $s->watch(        2 => 4, 3 => 4                , collector(\@result, 1));
+    checkCond($w[0], [1,2,3], {1 => 5, 2 => 5, 3 => 5}, "watcher 0");
+    checkCond($w[1], [2,3,4], {2 => 4, 3 => 4, 4 => 4}, "watcher 1");
+    checkCond($w[2], [1,4,5], {1 => 5, 4 => 5, 5 => 5}, "watcher 2");
+    checkCond($w[3], [2,3,4,5], {2 => 0, 3 => 0, 4 => 3, 5 => 5}, "watcher 3");
+    checkCond($w[4], [1,4,5], {1 => 2, 4 => 5, 5 => 2}, "watcher 4");
+    checkCond($w[5], [2,3], {2 => 4, 3 => 4}, "watcher 5");
     checkResult \@result, qw(2: 3:);
-    checkSNum $s, 5;
+    checkWNum $s, 5;
     @result = ();
     $rs->set(1 => "aa", 5 => "aa");
     checkResult \@result, qw(1:aa 5:aa);
-    checkSNum $s, 4;
+    checkWNum $s, 4;
     @result = ();
     $rs->set(3 => "AAAA", 4 => "AAAA");
     checkResult \@result, qw(3:AAAA 3:AAAA 4:AAAA);
-    checkSNum $s, 2;
+    checkWNum $s, 2;
     @result = ();
     $rs->set(map {$_ => "bbbbbb"} 1 .. 5);
     checkResult \@result, qw(1:bbbbbb 2:bbbbbb 3:bbbbbb 1:bbbbbb 4:bbbbbb 5:bbbbbb);
-    checkSNum $s, 0;
+    checkWNum $s, 0;
     @result = ();
     $rs->set(map {$_ => "cccccccccccc"} 1 .. 5);
     checkResult \@result;
-    checkSNum $s, 0;
+    checkWNum $s, 0;
+}
+
+{
+    note('--- 2 selectors with same resource names');
+    my @s = ();
+    my @r = ();
+    my @w = ();
+    my @results = ([], []);
+    foreach my $i (0 .. 1) {
+        $s[$i] = Async::Selector->new();
+        $r[$i] = Async::Selector::Sample::Resources->new($s[$i], 1..5);
+        $w[$i] = $s[$i]->watch(2 => 2, 3 => 3, 4 => 4, 6 => 6, sub {
+            my ($w, %res) = @_;
+            is($w, $w[$i], "correct watcher");
+            push(@{$results[$i]}, map { "${i}_$_:$res{$_}" } sort {$a cmp $b} keys %res);
+            $w->cancel();
+        });
+    }
+    ok($_->active, "both active") foreach @w;
+    is_deeply(\@results, [[], []], "no results");
+    $r[0]->set(1 => "aaaaa");
+    $r[1]->set(5 => "eeeee");
+    ok($_->active, "both active") foreach @w;
+    is_deeply(\@results, [[], []], "still no results");
+    $r[0]->set(3 => "cccc", 4 => "dddd");
+    $r[1]->set(2 => "b", 4 => "ddd");
+    ok(!$w[0]->active, "w0 fired");
+    ok($w[1]->active, "w1 still active");
+    is_deeply(\@results, [['0_3:cccc', '0_4:dddd'], []]);
+    $r[0]->set(2 => "bbbbbbb");
+    $r[1]->set(2 => "bbbbbbb");
+    ok(!$w[1]->active, "w1 fired");
+    is_deeply(\@results, [['0_3:cccc', '0_4:dddd'], ['1_2:bbbbbbb']]);
 }
 
 done_testing();

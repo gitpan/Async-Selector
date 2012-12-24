@@ -5,6 +5,7 @@ use strict;
 use warnings;
 
 use Carp;
+use Async::Selector::Watcher;
 
 
 =pod
@@ -16,16 +17,17 @@ Async::Selector - level-triggered resource observer like select(2)
 
 =head1 VERSION
 
-0.02
+1.01
 
 =cut
 
-our $VERSION = "0.02";
+our $VERSION = "1.01";
 
 
 =pod
 
 =head1 SYNOPSIS
+
 
     use Async::Selector;
     
@@ -33,22 +35,22 @@ our $VERSION = "0.02";
     
     ## Register resource
     my $resource = "some text.";  ## 10 bytes
-    $selector->register(
-        resource_A => sub {
-            my $threshold = shift;
-            return length($resource) >= $threshold ? $resource : undef;
-        }
-    );
+    
+    $selector->register(resource_A => sub {
+        ## If $resource has more data than $threshold bytes, provide it.
+        my $threshold = shift;
+        return length($resource) >= $threshold ? $resource : undef;
+    });
     
     
-    ## Select the resource with a callback.
-    $selector->select(
-        sub {
-            my ($id, %resource) = @_;
+    ## Watch the resource with a callback.
+    $selector->watch(
+        resource_A => 20,  ## When the resource gets more than 20 bytes...
+        sub {              ## ... execute this callback.
+            my ($watcher, %resource) = @_;
             print "$resource{resource_A}\n";
-            return 1;
-        },
-        resource_A => 20,  ## Tell me when the resource gets more than 20 bytes!
+            $watcher->cancel();
+        }
     );
     
     
@@ -62,7 +64,7 @@ our $VERSION = "0.02";
 
 =head1 DESCRIPTION
 
-L<Async::Selector> is an object that observes registered resources
+L<Async::Selector> is an object that watches registered resources
 and executes callbacks when some of the resources are available.
 Thus it is an implementation of the Observer pattern like L<Event::Notify>,
 but the important difference is that L<Async::Selector> is B<level-triggered> like C<select(2)> system call.
@@ -81,12 +83,12 @@ A resource provier is a subroutine reference that returns some data (or C<undef>
 
 =item 2.
 
-Select as many resources as you like by C<select()> method.
+Watch as many resources as you like by C<watch()> method.
 
-When any of the selected resources gets available, a callback function is executed
+When any of the watched resources gets available, a callback function is executed
 with the available resource data.
 
-Note that if some of the selected resources is available when calling C<select()> method,
+Note that if some of the watched resources is already available when calling C<watch()> method,
 it executes the callback function immediately.
 That's because L<Async::Selector> is level-triggered.
 
@@ -95,9 +97,8 @@ That's because L<Async::Selector> is level-triggered.
 
 Notify the L<Async::Selector> object by C<trigger()> method that some of the registered resources have changed.
 
-
-The L<Async::Selector> object then checks if any of the selected resources gets available.
-In this case the callback function given by C<select()> method is executed.
+The L<Async::Selector> object then checks if any of the triggered resources gets available.
+If some resources become available, the callback function given by C<watch()> method is executed.
 
 
 =back
@@ -118,32 +119,34 @@ sub new {
    my ($class) = @_;
    my $self = bless {
        resources => {},
-       selections => {},
+       watchers => {},
    }, $class;
    return $self;
 }
 
 sub _check {
-   my ($self, $selection_id) = @_;
+   my ($self, $watcher_id_or_watcher, @triggers) = @_;
    my %results = ();
    my $fired = 0;
-   my $selection = $self->{selections}{$selection_id};
-   return 0 if !defined($selection);
-   foreach my $res_key (keys %{$selection->{conditions}}) {
-       my $input = $selection->{conditions}{$res_key};
-       if(!defined($self->{resources}{$res_key})) {
-           $results{$res_key} = undef;
-           next;
-       }
-       $results{$res_key} = $self->{resources}{$res_key}->($input);
-       if(defined($results{$res_key})) {
+   my $watcher = $self->{watchers}{"$watcher_id_or_watcher"};
+   return 0 if !defined($watcher);
+   my %conditions = $watcher->conditions;
+   if($watcher->getCheckAll) {
+       @triggers = $watcher->resources;
+   }
+   foreach my $res_key (@triggers) {
+       next if not defined $res_key;
+       next if not exists($conditions{$res_key});
+       next if not defined($self->{resources}{$res_key});
+       my $input = $conditions{$res_key};
+       my $result = $self->{resources}{$res_key}->($input);
+       if(defined($result)) {
            $fired = 1;
+           $results{$res_key} = $result;
        }
    }
    return 0 if !$fired;
-   if($selection->{cb}->($selection_id, %results)) {
-       $self->cancel($selection_id);
-   }
+   $watcher->call(%results);
    return 1;
 }
 
@@ -158,7 +161,7 @@ A resource is described as a pair of resource name and resource provider.
 You can register as many resources as you like.
 
 The resource name (C<$name>) is an arbitrary string.
-It is used to select the resource in C<select()> method.
+It is used to select the resource in C<watch()> method.
 If C<$name> is already registered with C<$selector>,
 the resource provider is updated with C<$provider> and the old one is discarded.
 
@@ -167,7 +170,7 @@ Its return value is supposed to be a scalar data of the resource if it's availab
 or C<undef> if it's NOT available.
 
 C<$provider> subroutine takes a scalar argument (C<$condition_input>),
-which is given in arguments of C<select()> method.
+which is given by the user in arguments of C<watch()> method.
 C<$provider> can decide whether to provide the resource according to C<$condition_input>.
 
 C<register()> method returns C<$selector> object itself.
@@ -175,11 +178,12 @@ C<register()> method returns C<$selector> object itself.
 
 =cut
 
+
 sub register {
    my ($self, %providers) = @_;
    my @error_keys = ();
    while(my ($key, $provider) = each(%providers)) {
-       if(!defined($provider) || !defined(ref($provider)) || ref($provider) ne 'CODE') {
+       if(!_isaCoderef($provider)) {
            push(@error_keys, $key);
        }
    }
@@ -213,101 +217,132 @@ sub unregister {
 
 =pod
 
-=head2 $selection_id = $selector->select($callback->($selection_id, %resources), $name => $condition_input, ...);
+=head2 $watcher = $selector->watch($name => $condition_input, ..., $callback->($watcher, %resources));
 
-Selects resources.
-A resource selection is described as a pair of resource name and condition input for the resource.
-You can select as many resources as you like.
+Starts to watch resources.
+A watch is described as pairs of resource names and condition inputs for the resources.
 
-C<$callback> is a subroutine reference that is executed when any of the selected resources gets available.
-Its first argument C<$selection_id> is the ID for this selection. It is the same value as the ID returned from C<select()> method.
-The other argument (C<%resources>) is a hash whose key is the resource name and value is the resource data.
-Note that some values in C<%resources> can be C<undef>, meaning that those resources are not available.
-Note also that C<$callback> is executed before C<select()> method returns
-if some of the selected resources is already available.
-
-C<$callback> is supposed to return a boolean value.
-If the return value is true, the selection is automatically canceled after the execution of C<$callback>.
-If the return value is false, the selection remains.
-
-C<$name> is the resource name that you want to select. It is the name given in C<register()> method.
+C<$name> is the resource name that you want to watch. It is the name given in C<register()> method.
 
 C<$condition_input> describes the condition the resource has to meet to be considered as "available".
-C<$condition_input> is an arbitrary scalar, and it's interpretation is up to the resource provider.
+C<$condition_input> is an arbitrary scalar, and its interpretation is up to the resource provider.
 
-C<select()> method returns an ID for the selection (C<$selection_id>),
-which can be used to cancel the selection in C<cancel()> method.
-If C<$callback> is executed before C<select()> returns and C<$callback> returns true,
-C<select()> returns C<undef> because the selection is already removed.
+You can list as many C<< $name => condition_input >> pairs as you like.
 
-If no resource selection (C<$name> => C<$condition_input> pair) is specified,
-C<select()> method silently ignores it.
-As a result, it returns C<undef> and the C<$callback> is never executed.
+C<$callback> is a subroutine reference that is executed when any of the watched resources gets available.
+Its first argument C<$watcher> is an object of L<Async::Selector::Watcher> which represents the watch you just made by C<watch()> method.
+This object is the same instance as the return value of C<watch()> method.
+The other argument (C<%resources>) is a hash whose keys are the available resource names and values are the corresponding resource data.
+Note that C<$callback> is executed before C<watch()> method returns
+if some of the watched resources is already available.
+
+The return value of C<$callback> is just ignored by L<Async::Selector>.
+
+C<watch()> method returns an object of L<Async::Selector::Watcher> (C<$watcher>) which represents the watch you just made by C<watch()> method.
+C<$watcher> gives you various information such as the list of watched resources and whether the watcher is active or not.
+See L<Async::Selector::Watcher> for detail.
+
+The watcher created by C<watch()> method is persistent in nature, i.e., it remains in the L<Async::Selector> object
+and C<$callback> can be executed repeatedly. To cancel the watcher and release the C<$callback>,
+call C<< $watcher->cancel() >> method.
+
+If no resource selection (C<< $name => $condition_input >> pair) is specified,
+C<watch()> method silently ignores it.
+As a result, it returns a C<$watcher> object which is already canceled and inactive.
 
 
-=head2 $selection_id = $selector->select_lt(...);
+=head2 $watcher = $selector->watch_lt(...);
 
-C<select_lt()> method is an alias for C<select()> method.
+C<watch_lt()> method is an alias for C<watch()> method.
 
 
-=head2 $selection_id = $selector->select_et(...);
+=head2 $watcher = $selector->watch_et(...);
 
-This method is just like C<select()> method but it emulates edge-triggered selection.
+This method is just like C<watch()> method but it emulates edge-triggered watch.
 
-To emulate edge-triggered behavior, C<select_et()> won't execute
-the C<$callback> at the time of selection.
-The C<$callback> is executed only when some of the selected resources
-gets available via C<trigger()> method.
+To emulate edge-triggered behavior, C<watch_et()> won't execute
+the C<$callback> immediately even if some of the watched resources are available.
+The C<$callback> is executed only when C<trigger()> method is called on
+resources that are watched and available.
+
 
 =cut
 
-sub select_et {
-    my ($self, $cb, %conditions) = @_;
-    if(!defined($cb) || !defined(ref($cb)) || ref($cb) ne "CODE") {
+sub _isaCoderef {
+    my ($coderef) = @_;
+    return (defined($coderef) && defined(ref($coderef)) && ref($coderef) eq "CODE");
+}
+
+sub watch_et {
+    my $self = shift;
+    my (%conditions, $cb);
+    $cb = pop;
+    if(!_isaCoderef($cb)) {
+        croak "the watch callback must be a coderef.";
+    }
+    %conditions = @_;
+    if(!%conditions) {
+        return Async::Selector::Watcher->new(
+            undef, \%conditions, $cb
+        );
+    }
+    my $watcher = Async::Selector::Watcher->new(
+        $self, \%conditions, $cb
+    );
+    $self->{watchers}{"$watcher"} = $watcher;
+    return $watcher;
+}
+
+sub watch_lt {
+    my ($self, @args) = @_;
+    my $watcher;
+    $watcher = $self->watch_et(@args);
+    return $watcher if !$watcher->active;
+    $self->_check($watcher, $watcher->resources);
+    return $watcher;
+}
+
+*watch = \&watch_lt;
+
+sub _wrapSelect {
+    my ($self, $method, $cb, %conditions) = @_;
+    if(!_isaCoderef($cb)) {
         croak "the select callback must be a coderef.";
     }
-    if(!%conditions) {
-        return undef;
-    }
-    my $selection = {
-        conditions => \%conditions,
-        cb => $cb,
+    my $wrapped_cb = sub {
+        my ($w, %res) = @_;
+        foreach my $selected_resource ($w->resources) {
+            $res{$selected_resource} = undef if not exists($res{$selected_resource});
+        }
+        if($cb->("$w", %res)) {
+            $w->cancel();
+        }
     };
-    my $id = "$selection";
-    $self->{selections}{$id} = $selection;
-    return $id;
+    my $watcher = $self->$method(%conditions, $wrapped_cb);
+    $watcher->setCheckAll(1);
+    return $watcher->active ? "$watcher" : undef;
+}
+
+sub select_et {
+    my ($self, @args) = @_;
+    return $self->_wrapSelect('watch_et', @args);
 }
 
 sub select_lt {
-    my ($self, $cb, %conditions) = @_;
-    my $id;
-    $id = $self->select_et($cb, %conditions);
-    return undef if not defined($id);
-    $self->_check($id);
-    return defined($self->{selections}{$id}) ? $id : undef;
+    my ($self, @args) = @_;
+    return $self->_wrapSelect('watch_lt', @args);
 }
 
 *select = \&select_lt;
 
-
-=pod
-
-=head2 $selector->cancel($selection_id, ...);
-
-Cancel selections so that their callback functions won't be executed.
-
-C<$selection_id> is the selection ID you want to cancel.
-It is returned by C<select()> method.
-You can specify as many C<$selection_id>s as you like.
-
-C<cancel()> method returns C<$selector> object itself.
-
-=cut
-
 sub cancel {
-   my ($self, @ids) = @_;
-   delete @{$self->{selections}}{grep { defined($_) } @ids};
-   return $self;
+    my ($self, @watchers) = @_;
+    foreach my $w (grep { defined($_) } @watchers) {
+        next if not exists $self->{watchers}{"$w"};
+        $self->{watchers}{"$w"}->detach();
+        delete $self->{watchers}{"$w"};
+    }
+    return $self;
 }
 
 =pod
@@ -316,8 +351,11 @@ sub cancel {
 
 Notify C<$selector> that the resources specified by C<$name>s may be changed.
 
-C<$name> is the name of the resource that have been changed.
+C<$name> is the name of the resource that might have been changed.
 You can specify as many C<$name>s as you like.
+
+Note that you may call C<trigger()> on resources that are not actually changed.
+It is up to the resource provider to decide whether to provide the resource to watchers.
 
 C<trigger()> method returns C<$selector> object itself.
 
@@ -325,18 +363,11 @@ C<trigger()> method returns C<$selector> object itself.
 
 sub trigger {
    my ($self, @resources) = @_;
-   my @affected_selections = ();
-   selec_loop: foreach my $selection (values %{$self->{selections}}) {
-       foreach my $res (@resources) {
-           next if !defined($res);
-           if(defined($selection->{conditions}{$res})) {
-               push(@affected_selections, $selection);
-               next selec_loop;
-           }
-       }
+   if(!@resources) {
+       return $self;
    }
-   foreach my $selection (@affected_selections) {
-       $self->_check($selection);
+   foreach my $watcher ($self->watchers(@resources)) {
+       $self->_check($watcher, @resources);
    }
    return $self;
 }
@@ -354,18 +385,62 @@ sub resources {
     return keys %{$self->{resources}};
 }
 
-
 =pod
 
-=head2 @selection_ids = $selector->selections();
+=head2 $is_registered = $selector->registered($resource_name);
 
-Returns the list of currently active selection IDs.
+Returns true if C<$resource_name> is registered with the L<Async::Selector> object.
+Returns false otherwise.
 
 =cut
 
+sub registered {
+    my ($self, $resource_name) = @_;
+    return 0 if not defined($resource_name);
+    return exists $self->{resources}{$resource_name};
+}
+
+
+=pod
+
+
+=head2 @watchers = $selector->watchers([@resource_names]);
+
+Returns the list of active watchers (L<Async::Selector::Watcher> objects) from the L<Async::Selector> object.
+
+If C<watchers()> method is called without argument, it returns all of the active watchers.
+
+If C<watchers()> method is called with some arguments (C<@resource_names>),
+it returns active watchers that watch ANY resource out of C<@resource_names>.
+
+If you want watchers that watch ALL of C<@resource_names>,
+try filtering the result (C<@watchers>) with L<Async::Selector::Watcher>'s C<resources()> method.
+
+=cut
+
+sub watchers {
+    my ($self, @resources) = @_;
+    if(!@resources) {
+        return values %{$self->{watchers}};
+    }
+    my @affected_watchers = ();
+  watcher_loop: foreach my $watcher (values %{$self->{watchers}}) {
+        my %watch_conditions = $watcher->conditions;
+        foreach my $res (@resources) {
+            next if !defined($res);
+            if(exists($watch_conditions{$res})) {
+                push(@affected_watchers, $watcher);
+                next watcher_loop;
+            }
+        }
+    }
+    return @affected_watchers;
+}
+
+
 sub selections {
     my ($self) = @_;
-    return keys %{$self->{selections}};
+    return map { "$_" } $self->watchers;
 }
 
 
@@ -373,7 +448,55 @@ sub selections {
 
 =head1 EXAMPLES
 
-=head2 Multiple resources, multiple selections
+=head2 Level-triggered vs. edge-triggered
+
+Watchers created by C<watch()> and C<watch_lt()> methods are level-triggered.
+This means their callbacks can be immediately executed if some of the watched resources
+are already available.
+
+Watchers created by C<watch_et()> method are edge-triggered.
+This means their callbacks are never executed at the moment C<watch_et()> is called.
+
+Both level-triggered and edge-triggered watcher callbacks are executed
+when some of the watched resources are C<trigger()>-ed AND available.
+
+
+    my $selector = Async::Selector->new();
+    my $a = 10;
+    $selector->register(a => sub { my $t = shift; return $a >= $t ? $a : undef });
+
+    ## Level-triggered watch
+    $selector->watch_lt(a => 5, sub { ## => LT: 10
+        my ($watcher, %res) = @_;
+        print "LT: $res{a}\n";
+    });
+    $selector->trigger('a');          ## => LT: 10
+    $a = 12;
+    $selector->trigger('a');          ## => LT: 12
+    $a = 3;
+    $selector->trigger('a');          ## Nothing happens because $a == 3 < 5.
+
+    ## Edge-triggered watch
+    $selector->watch_et(a => 2, sub { ## Nothing happens because it's edge-triggered
+        my ($watcher, %res) = @_;
+        print "ET: $res{a}\n";
+    });
+    $selector->trigger('a');          ## => ET: 3
+    $a = 0;
+    $selector->trigger('a');          ## Nothing happens.
+    $a = 10;
+    $selector->trigger('a');          ## => LT: 10
+                                      ## => ET: 10
+
+
+
+=head2 Multiple resources, multiple watches
+
+You can register multiple resources with a single L<Async::Selector>
+object.  You can watch multiple resources with a single call of
+C<watch()> method.  If you watch multiple resources, the callback is
+executed when any of the watched resources is available.
+
 
     my $selector = Async::Selector->new();
     my $a = 5;
@@ -384,24 +507,20 @@ sub selections {
         b => sub { my $t = shift; return $b >= $t ? $b : undef },
         c => sub { my $t = shift; return $c >= $t ? $c : undef },
     );
-    $selector->select(
+    $selector->watch(a => 10, sub {
+        my ($watcher, %res) = @_;
+        print "Select 1: a is $res{a}\n";
+        $watcher->cancel();
+    });
+    $selector->watch(
+        a => 12, b => 15, c => 15,
         sub {
-            my ($id, %res) = @_;
-            print "Select 1: a is $res{a}\n";
-            return 1;
-        },
-        a => 10
-    );
-    $selector->select(
-        sub {
-            my ($id, %res) = @_;
+            my ($watcher, %res) = @_;
             foreach my $key (sort keys %res) {
-                next if not defined($res{$key});
                 print "Select 2: $key is $res{$key}\n";
             }
-            return 1;
-        },
-        a => 12, b => 15, c => 15,
+            $watcher->cancel();
+        }
     );
 
     ($a, $b, $c) = (11, 14, 14);
@@ -412,7 +531,14 @@ sub selections {
                                     ## -> Select 2: c is 20
 
 
-=head2 Auto-cancel and non-cancel selections
+=head2 One-shot and persistent watches
+
+The watchers are persistent by default, that is, they remain in the
+L<Async::Selector> object no matter how many times their callbacks
+are executed.
+
+If you want to execute your callback just one time, call C<< $watcher->cancel() >>
+in the callback.
 
 
     my $selector = Async::Selector->new();
@@ -423,41 +549,121 @@ sub selections {
         B => sub { my $in = shift; return length($B) >= $in ? $B : undef },
     );
 
-    my $sel_a = $selector->select(
-        sub {
-            my ($id, %res) = @_;
-            print "A: $res{A}\n";
-            return 1; ## auto-cancel
-        },
-        A => 5
-    );
-    my $sel_b = $selector->select(
-        sub {
-            my ($id, %res) = @_;
-            print "B: $res{B}\n";
-            return 0; ## non-cancel
-        },
-        B => 5
-    );
+    my $watcher_a = $selector->watch(A => 5, sub {
+        my ($watcher, %res) = @_;
+        print "A: $res{A}\n";
+        $watcher->cancel(); ## one-shot callback
+    });
+    my $watcher_b = $selector->watch(B => 5, sub {
+        my ($watcher, %res) = @_;
+        print "B: $res{B}\n";
+        ## persistent callback
+    });
 
     ## Trigger the resources.
-    ## Execution order of selection callbacks is not guaranteed.
+    ## Execution order of watcher callbacks is not guaranteed.
     ($A, $B) = ('aaaaa', 'bbbbb');
-    $selector->trigger('A', 'B');   ## -> B: bbbbb
-                                    ## -> A: aaaaa
+    $selector->trigger('A', 'B');   ## -> A: aaaaa
+                                    ## -> B: bbbbb
     print "--------\n";
-    ## $sel_a is automatically canceled.
+    ## $watcher_a is already canceled.
     ($A, $B) = ('AAAAA', 'BBBBB');
     $selector->trigger('A', 'B');   ## -> B: BBBBB
     print "--------\n";
 
     $B = "CCCCCCC";
-    $selector->trigger('A', 'B');        ## -> B: CCCCCCC
+    $selector->trigger('A', 'B');   ## -> B: CCCCCCC
     print "--------\n";
 
-    $selector->cancel($sel_b);
+    $watcher_b->cancel();
     $selector->trigger('A', 'B');        ## Nothing happens.
 
+
+=head2 Real-time Web: Comet (long-polling) and WebSocket
+
+L<Async::Selector> can be used for foundation of so-called real-time
+Web.  Resource registered with an L<Async::Selector> object can be
+pushed to Web browsers via Comet (long-polling) and/or WebSocket.
+
+See L<Async::Selector::Example::Mojo> for detail.
+
+
+=head1 COMPATIBILITY
+
+The following methods that existed in L<Async::Selector> v0.02 or older are supported but not recommended
+in this version.
+
+=over
+
+=item *
+
+C<select()>
+
+=item *
+
+C<select_lt()>
+
+=item *
+
+C<select_et()>
+
+=item *
+
+C<selections()>
+
+=item *
+
+C<cancel()>
+
+=back
+
+Currently the C<watch> methods are substituted for the C<select> methods.
+
+The differences between C<watch> and C<select> methods are as follows.
+
+=over
+
+=item *
+
+C<watch> methods take the watcher callback from the last argument, while C<select> methods
+take it from the first argument.
+
+
+=item *
+
+C<watch> methods return L<Async::Selector::Watcher> objects, while C<select> methods
+return selection IDs, which are strings.
+
+=item *
+
+The callback function for C<watch> receives L<Async::Selector::Watcher> object from the
+first argument, while the callback for C<select> receives the selection ID.
+
+=item *
+
+The second argument for the callback function is also different.
+For C<watch> methods, it is a hash of resources that are watched, triggered and available.
+For C<select> methods, it is a hash of all the watched resources with values
+for unavailable resources being C<undef>.
+
+=item *
+
+Return values from the callback function for C<watch> methods are ignored,
+while those for C<select> methods are used to automatically cancel the selection.
+
+
+=item *
+
+C<trigger()> method executes the callback for C<watch> methods when it triggers resources
+that are watched and available.
+On the other hand, C<trigger()> method executes the callback for C<select> when it triggers
+resources that are watched, and some of the watched resources are available.
+So if you trigger an unavailable watched resource and don't trigger any available watched resource,
+the C<select> callback is executed with available resources even though they are not triggered.
+
+
+
+=back
 
 
 =head1 SEE ALSO
