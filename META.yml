@@ -1,11 +1,12 @@
 ---
 abstract: 'level-triggered resource observer like select(2)'
 author:
-  - 'Toshio Ito <debug.ito@gmail.com>'
+  - 'Toshio Ito <toshioito@cpan.org>'
 build_requires:
   FindBin: 0
   List::Util: 0
   Test::Exception: 0
+  Test::Memory::Cycle: 0
   Test::More: 0
   Test::Warn: 0
 configure_requires:
@@ -24,4 +25,4 @@ no_index:
 requires:
   Carp: 0
   Scalar::Util: 0
-version: 1.011
+version: 1.02

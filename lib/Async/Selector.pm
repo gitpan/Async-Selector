@@ -17,11 +17,11 @@ Async::Selector - level-triggered resource observer like select(2)
 
 =head1 VERSION
 
-1.011
+1.02
 
 =cut
 
-our $VERSION = "1.011";
+our $VERSION = "1.02";
 
 
 =pod
@@ -576,7 +576,43 @@ in the callback.
     print "--------\n";
 
     $watcher_b->cancel();
-    $selector->trigger('A', 'B');        ## Nothing happens.
+    $selector->trigger('A', 'B');   ## Nothing happens.
+
+=head2 Watcher aggregator
+
+Sometimes you might want to use multiple L<Async::Selector> objects
+and watch their resources simultaneously.
+In this case, you can use L<Async::Selector::Aggregator> to aggregate
+watchers produced by L<Async::Selector> objects.
+See L<Async::Selector::Aggregator> for details.
+
+    my $selector_a = Async::Selector->new();
+    my $selector_b = Async::Selector->new();
+    my $A = "";
+    my $B = "";
+    $selector_a->register(resource => sub { my $in = shift; return length($A) >= $in ? $A : undef });
+    $selector_b->register(resource => sub { my $in = shift; return length($B) >= $in ? $B : undef });
+    
+    my $watcher_a = $selector_a->watch(resource => 5, sub {
+        my ($watcher, %res) = @_;
+        print "A: $res{resource}\n";
+    });
+    my $watcher_b = $selector_b->watch(resource => 5, sub {
+        my ($watcher, %res) = @_;
+        print "B: $res{resource}\n";
+    });
+    
+    ## Aggregates the two watchers into $aggregator
+    my $aggregator = Async::Selector::Aggregator->new();
+    $aggregator->add($watcher_a);
+    $aggregator->add($watcher_b);
+    
+    ## This cancels both $watcher_a and $watcher_b
+    $aggregator->cancel();
+    
+    print("watcher_a: " . ($watcher_a->active ? "active" : "inactive") . "\n"); ## -> watcher_a: inactive
+    print("watcher_b: " . ($watcher_b->active ? "active" : "inactive") . "\n"); ## -> watcher_b: inactive
+
 
 
 =head2 Real-time Web: Comet (long-polling) and WebSocket
@@ -673,7 +709,7 @@ L<Event::Notify>, L<Notification::Center>
 
 =head1 AUTHOR
 
-Toshio Ito, C<< <debug.ito at gmail.com> >>
+Toshio Ito, C<< <toshioito at cpan.org> >>
 
 =head1 BUGS
 
@@ -716,7 +752,7 @@ L<http://search.cpan.org/dist/Async-Selector/>
 
 =head1 LICENSE AND COPYRIGHT
 
-Copyright 2012 Toshio Ito.
+Copyright 2012-2013 Toshio Ito.
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of either: the GNU General Public License as published
